@@ -1,0 +1,118 @@
+---
+title: "RNA-seq Differential Expression — Colorectal Cancer (GSE50760)"
+author: "Miguel Castro"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center")
+library(SummarizedExperiment); library(edgeR); library(limma)
+library(org.Hs.eg.db); library(GO.db); library(AnnotationDbi)
+library(ggplot2); library(ggrepel)
+```
+
+## Data and subset
+
+Load the `SummarizedExperiment` (18 patients, 3 paired conditions each) and draw a random
+10-patient subset.
+
+```{r data}
+load("PEC2_GSE50760_colorectal_SE.Rda")   # obtain from GEO: GSE50760
+set.seed(2943)
+selected <- sample(unique(se$patient_id), 10)
+se_sub <- se[, se$patient_id %in% selected]
+table(se_sub$patient_id, se_sub$condition)   # check: 1 sample per condition per patient
+```
+
+## QC: logCPM distributions and PCA
+
+```{r qc}
+dge_exp <- calcNormFactors(DGEList(counts = assay(se_sub, "counts")), method = "TMM")
+logcpm  <- cpm(dge_exp, log = TRUE, prior.count = 2)
+
+# PCA on the 1000 most variable genes: PC1 separates normal from tumoural tissue
+top <- names(sort(apply(logcpm, 1, var), decreasing = TRUE))[1:1000]
+pca <- prcomp(t(logcpm[top, ]), scale. = TRUE)
+ve  <- round(summary(pca)$importance[2, 1:2] * 100, 1)
+ggplot(data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2],
+                  condition = se_sub$condition),
+       aes(PC1, PC2, colour = condition)) +
+  geom_point(size = 3, alpha = 0.8) + theme_bw() +
+  labs(x = paste0("PC1 (", ve[1], "%)"), y = paste0("PC2 (", ve[2], "%)"))
+```
+
+## Filtering, normalisation, and paired design
+
+Keep normal vs primary tumour, filter low-count genes, TMM-normalise, and build a
+patient-blocked design so the tumour effect is estimated within patient.
+
+```{r design}
+se_pn <- se_sub[, se_sub$condition %in% c("normal", "primary_tumor")]
+se_pn$condition  <- droplevels(se_pn$condition)
+se_pn$patient_id <- droplevels(factor(se_pn$patient_id))
+
+dge  <- DGEList(counts = assay(se_pn, "counts"), genes = as.data.frame(rowData(se_pn)))
+keep <- filterByExpr(dge, group = se_pn$condition)     # ~39k -> ~19k genes
+dge  <- calcNormFactors(dge[keep, , keep.lib.sizes = FALSE], method = "TMM")
+
+design <- model.matrix(~ patient_id + condition,
+                       data = data.frame(patient_id = se_pn$patient_id,
+                                         condition = relevel(se_pn$condition, ref = "normal")))
+```
+
+## Differential expression (limma-voom)
+
+```{r de}
+v   <- voom(dge, design, plot = FALSE)
+fit <- eBayes(lmFit(v, design))
+results <- topTable(fit, coef = "conditionprimary_tumor", number = Inf, sort.by = "none")
+
+# thresholds: FDR < 0.05 and |log2FC| > 2  ->  1010 DEGs (280 up, 730 down)
+degs <- results[results$adj.P.Val < 0.05 & abs(results$logFC) > 2, ]
+up   <- degs[degs$logFC > 0, ]; down <- degs[degs$logFC < 0, ]
+c(total = nrow(degs), up = nrow(up), down = nrow(down))
+```
+
+Volcano plot.
+
+```{r volcano}
+results$sig <- "Not significant"
+results$sig[results$adj.P.Val < 0.05 & results$logFC >  2] <- "Up in tumour"
+results$sig[results$adj.P.Val < 0.05 & results$logFC < -2] <- "Down in tumour"
+results$neglog <- pmin(-log10(results$adj.P.Val), 15)
+ggplot(results, aes(logFC, neglog, colour = sig)) +
+  geom_point(size = 0.6, alpha = 0.5) +
+  geom_vline(xintercept = c(-2, 2), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_bw() + labs(x = "log2 fold change", y = "-log10(FDR)", colour = "")
+```
+
+## Over-representation analysis (GO-BP)
+
+Hypergeometric test of the up-regulated genes against GO Biological Process terms (BH
+correction). Enriched terms are dominated by inflammation, ECM remodelling, and EMT.
+
+```{r ora}
+up_entrez <- as.character(up$entrez_id[up$has_entrez == TRUE])
+universe  <- as.character(results$entrez_id[results$has_entrez == TRUE])
+
+go <- AnnotationDbi::select(org.Hs.eg.db, keys = keys(org.Hs.eg.db, "ENTREZID"),
+                            columns = c("GO", "ONTOLOGY"), keytype = "ENTREZID")
+go <- go[go$ONTOLOGY == "BP" & !is.na(go$GO), ]
+go2gene <- split(go$ENTREZID, go$GO)
+sizes   <- sapply(go2gene, function(x) length(intersect(unique(x), universe)))
+go2gene <- go2gene[sizes >= 10 & sizes <= 500]
+
+N <- length(universe); k <- length(intersect(up_entrez, universe))
+ora <- lapply(names(go2gene), function(id) {
+  m <- length(intersect(go2gene[[id]], universe))
+  q <- length(intersect(up_entrez, intersect(go2gene[[id]], universe)))
+  if (q < 2) return(NULL)
+  data.frame(GOID = id, Count = q, pvalue = phyper(q - 1, m, N - m, k, lower.tail = FALSE))
+})
+ora <- do.call(rbind, ora)
+ora$FDR  <- p.adjust(ora$pvalue, method = "BH")
+ora$Term <- AnnotationDbi::select(GO.db, keys = ora$GOID, columns = "TERM",
+                                  keytype = "GOID")$TERM
+head(ora[order(ora$FDR), c("Term", "Count", "FDR")], 10)
+```
